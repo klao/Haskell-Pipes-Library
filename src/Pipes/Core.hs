@@ -87,8 +87,10 @@ module Pipes.Core (
     (<<+)
     ) where
 
+import Control.Monad (join)
 import Data.Void (Void, absurd)
-import Pipes.Internal (Proxy(..))
+import Pipes.Core.Steppable
+import Pipes.Internal (Proxy(..), fromProxySteppable, toProxySteppable)
 
 {- $proxy
     Diagrammatically, you can think of a 'Proxy' as having the following shape:
@@ -122,14 +124,8 @@ import Pipes.Internal (Proxy(..))
 
 -- | Run a self-contained 'Effect', converting it back to the base monad
 runEffect :: (Monad m) => Effect m r -> m r
-runEffect = go
-  where
-    go p = case p of
-        Request v _ -> absurd v
-        Respond v _ -> absurd v
-        M       m   -> m >>= go
-        Pure    r   -> return r
-{-# INLINABLE runEffect #-}
+runEffect p = unProxy p (\v _ -> absurd v) (\v _ -> absurd v) join return
+{-# INLINE runEffect #-}
 
 {-
    * Keep proxy composition lower in precedence than function composition, which
@@ -267,7 +263,7 @@ f '/>/' 'respond' = f
     'respond' is the identity of the respond category.
 -}
 respond :: (Monad m) => a -> Proxy x' x a' a m a'
-respond a = Respond a Pure
+respond a = Proxy (\_ respond' _ pure' -> respond' a pure')
 {-# INLINABLE respond #-}
 
 {-| Compose two unfolds, creating a new unfold
@@ -301,25 +297,15 @@ respond a = Respond a Pure
     -- ^
     ->       Proxy x' x c' c m a'
     -- ^
-p0 //> fb = go p0
-  where
-    go p = case p of
-        Request x' fx  -> Request x' (\x -> go (fx x))
-        Respond b  fb' -> fb b >>= \b' -> go (fb' b')
-        M          m   -> M (m >>= \p' -> return (go p'))
-        Pure       a   -> Pure a
+p //> fb =
+    Proxy (\request' respond' lift' pure' ->
+        unProxy p
+            request'
+            (\b fb' -> unProxy (fb b) request' respond' lift' fb')
+            lift'
+            pure' )
 {-# INLINABLE (//>) #-}
 
-{-# RULES
-    "(Request x' fx ) //> fb" forall x' fx  fb .
-        (Request x' fx ) //> fb = Request x' (\x -> fx x //> fb);
-    "(Respond b  fb') //> fb" forall b  fb' fb .
-        (Respond b  fb') //> fb = fb b >>= \b' -> fb' b' //> fb;
-    "(M          m  ) //> fb" forall    m   fb .
-        (M          m  ) //> fb = M (m >>= \p' -> return (p' //> fb));
-    "(Pure      a   ) //> fb" forall a      fb .
-        (Pure    a     ) //> fb = Pure a;
-  #-}
 
 {- $request
     The 'request' category closely corresponds to the iteratee design pattern.
@@ -380,7 +366,7 @@ f '\>\' 'request' = f
     'request' is the identity of the request category.
 -}
 request :: (Monad m) => a' -> Proxy a' a y' y m a
-request a' = Request a' Pure
+request a' = Proxy (\request' _ _ pure' -> request' a' pure')
 {-# INLINABLE request #-}
 
 {-| Compose two folds, creating a new fold
@@ -414,25 +400,15 @@ request a' = Request a' Pure
     -- ^
     ->        Proxy a' a y' y m c
     -- ^
-fb' >\\ p0 = go p0
-  where
-    go p = case p of
-        Request b' fb  -> fb' b' >>= \b -> go (fb b)
-        Respond x  fx' -> Respond x (\x' -> go (fx' x'))
-        M          m   -> M (m >>= \p' -> return (go p'))
-        Pure       a   -> Pure a
+fb' >\\ p =
+    Proxy (\request' respond' lift' pure' ->
+        unProxy p
+            (\b' fb -> unProxy (fb' b') request' respond' lift' fb)
+            respond'
+            lift'
+            pure' )
 {-# INLINABLE (>\\) #-}
 
-{-# RULES
-    "fb' >\\ (Request b' fb )" forall fb' b' fb  .
-        fb' >\\ (Request b' fb ) = fb' b' >>= \b -> fb' >\\ fb  b;
-    "fb' >\\ (Respond x  fx')" forall fb' x  fx' .
-        fb' >\\ (Respond x  fx') = Respond x (\x' -> fb' >\\ fx' x');
-    "fb' >\\ (M          m  )" forall fb'    m   .
-        fb' >\\ (M          m  ) = M (m >>= \p' -> return (fb' >\\ p'));
-    "fb' >\\ (Pure    a    )" forall fb' a      .
-        fb' >\\ (Pure    a     ) = Pure a;
-  #-}
 
 {- $push
     The 'push' category closely corresponds to push-based Unix pipes.
@@ -498,9 +474,9 @@ f '>~>' 'push' = f
     'push' is the identity of the push category.
 -}
 push :: (Monad m) => a -> Proxy a' a a' a m r
-push = go
-  where
-    go a = Respond a (\a' -> Request a' go)
+push a0 =
+    Proxy (\request' respond' _ _ ->
+        let go a = respond' a (\a' -> request' a' go) in go a0)
 {-# INLINABLE push #-}
 
 {-| Compose two proxies blocked while 'request'ing data, creating a new proxy
@@ -535,11 +511,7 @@ push = go
     -- ^
     ->       Proxy a' a c' c m r
     -- ^
-p >>~ fb = case p of
-    Request a' fa  -> Request a' (\a -> fa a >>~ fb)
-    Respond b  fb' -> fb' +>> fb b
-    M          m   -> M (m >>= \p' -> return (p' >>~ fb))
-    Pure       r   -> Pure r
+p >>~ fb = fromProxySteppable $ toProxySteppable p >>~. (toProxySteppable . fb)
 {-# INLINABLE (>>~) #-}
 
 {- $pull
@@ -606,9 +578,9 @@ f '>+>' 'pull' = f
     'pull' is the identity of the pull category.
 -}
 pull :: (Monad m) => a' -> Proxy a' a a' a m r
-pull = go
-  where
-    go a' = Request a' (\a -> Respond a go)
+pull a0' =
+    Proxy (\request' respond' _ _ ->
+        let go a' = request' a' (\a -> respond' a go) in go a0')
 {-# INLINABLE pull #-}
 
 {-| Compose two proxies blocked in the middle of 'respond'ing, creating a new
@@ -643,11 +615,7 @@ pull = go
     -- ^
     ->        Proxy a' a c' c m r
     -- ^
-fb' +>> p = case p of
-    Request b' fb  -> fb' b' >>~ fb
-    Respond c  fc' -> Respond c (\c' -> fb' +>> fc' c')
-    M          m   -> M (m >>= \p' -> return (fb' +>> p'))
-    Pure       r   -> Pure r
+fb' +>> p = fromProxySteppable $ (toProxySteppable . fb') +>>. toProxySteppable p
 {-# INLINABLE (+>>) #-}
 
 {- $reflect
@@ -684,13 +652,8 @@ fb' +>> p = case p of
 
 -- | Switch the upstream and downstream ends
 reflect :: (Monad m) => Proxy a' a b' b m r -> Proxy b b' a a' m r
-reflect = go
-  where
-    go p = case p of
-        Request a' fa  -> Respond a' (\a  -> go (fa  a ))
-        Respond b  fb' -> Request b  (\b' -> go (fb' b'))
-        M          m   -> M (m >>= \p' -> return (go p'))
-        Pure    r      -> Pure r
+reflect p = Proxy (\request' respond' lift' pure' ->
+                unProxy p respond' request' lift' pure')
 {-# INLINABLE reflect #-}
 
 {-| An effect in the base monad

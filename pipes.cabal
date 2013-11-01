@@ -51,6 +51,7 @@ Library
         Pipes,
         Pipes.Core,
         Pipes.Internal,
+        Pipes.Core.Steppable,
         Pipes.Lift,
         Pipes.Prelude,
         Pipes.Tutorial

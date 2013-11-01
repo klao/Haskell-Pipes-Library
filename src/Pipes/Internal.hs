@@ -26,10 +26,16 @@
   , CPP
   #-}
 module Pipes.Internal (
-    -- * Internal
+    -- * Church-encoded
     Proxy(..),
     unsafeHoist,
-    observe,
+    -- * Manifested
+    ProxySteppable(..),
+    unsafeHoistSteppable,
+    observeSteppable,
+    -- * Conversion
+    toProxySteppable,
+    fromProxySteppable,
     ) where
 
 import Control.Applicative (Applicative(pure, (<*>)), Alternative(empty, (<|>)))
@@ -43,8 +49,7 @@ import Control.Monad.State (MonadState(..))
 import Control.Monad.Writer (MonadWriter(..))
 import Data.Monoid (mempty,mappend)
 
-{-| A 'Proxy' is a monad transformer that receives and sends information on both
-    an upstream and downstream interface.
+{-| A 'ProxySteppable' is the manifested 'Proxy' type.
 
     The type variables signify:
 
@@ -58,13 +63,13 @@ import Data.Monoid (mempty,mappend)
 
     * @r @ - The return value
 -}
-data Proxy a' a b' b m r
-    = Request a' (a  -> Proxy a' a b' b m r )
-    | Respond b  (b' -> Proxy a' a b' b m r )
-    | M          (m    (Proxy a' a b' b m r))
+data ProxySteppable a' a b' b m r
+    = Request a' (a  -> ProxySteppable a' a b' b m r )
+    | Respond b  (b' -> ProxySteppable a' a b' b m r )
+    | M          (m    (ProxySteppable a' a b' b m r))
     | Pure    r
 
-instance (Monad m) => Functor (Proxy a' a b' b m) where
+instance (Monad m) => Functor (ProxySteppable a' a b' b m) where
     fmap f p0 = go p0 where
         go p = case p of
             Request a' fa  -> Request a' (\a  -> go (fa  a ))
@@ -72,7 +77,7 @@ instance (Monad m) => Functor (Proxy a' a b' b m) where
             M          m   -> M (m >>= \p' -> return (go p'))
             Pure    r      -> Pure (f r)
 
-instance (Monad m) => Applicative (Proxy a' a b' b m) where
+instance (Monad m) => Applicative (ProxySteppable a' a b' b m) where
     pure      = Pure
     pf <*> px = go pf where
         go p = case p of
@@ -81,15 +86,15 @@ instance (Monad m) => Applicative (Proxy a' a b' b m) where
             M          m   -> M (m >>= \p' -> return (go p'))
             Pure     f     -> fmap f px
 
-instance (Monad m) => Monad (Proxy a' a b' b m) where
+instance (Monad m) => Monad (ProxySteppable a' a b' b m) where
     return = Pure
     (>>=)  = _bind
 
 _bind
     :: (Monad m)
-    => Proxy a' a b' b m r
-    -> (r -> Proxy a' a b' b m r')
-    -> Proxy a' a b' b m r'
+    => ProxySteppable a' a b' b m r
+    -> (r -> ProxySteppable a' a b' b m r')
+    -> ProxySteppable a' a b' b m r'
 p0 `_bind` f = go p0 where
     go p = case p of
         Request a' fa  -> Request a' (\a  -> go (fa  a ))
@@ -108,7 +113,7 @@ p0 `_bind` f = go p0 where
         _bind (Pure    r   ) f = f r;
   #-}
 
-instance MonadTrans (Proxy a' a b' b) where
+instance MonadTrans (ProxySteppable a' a b' b) where
     lift m = M (m >>= \r -> return (Pure r))
 
 {-| 'unsafeHoist' is like 'hoist', but faster.
@@ -117,10 +122,10 @@ instance MonadTrans (Proxy a' a b' b) where
     if you do not pass a monad morphism as the first argument.  This function is
     safe if you pass a monad morphism as the first argument.
 -}
-unsafeHoist
+unsafeHoistSteppable
     :: (Monad m)
-    => (forall x . m x -> n x) -> Proxy a' a b' b m r -> Proxy a' a b' b n r
-unsafeHoist nat = go
+    => (forall x . m x -> n x) -> ProxySteppable a' a b' b m r -> ProxySteppable a' a b' b n r
+unsafeHoistSteppable nat = go
   where
     go p = case p of
         Request a' fa  -> Request a' (\a  -> go (fa  a ))
@@ -128,18 +133,18 @@ unsafeHoist nat = go
         M          m   -> M (nat (m >>= \p' -> return (go p')))
         Pure       r   -> Pure r
 
-instance MFunctor (Proxy a' a b' b) where
-    hoist nat p0 = go (observe p0) where
+instance MFunctor (ProxySteppable a' a b' b) where
+    hoist nat p0 = go (observeSteppable p0) where
         go p = case p of
             Request a' fa  -> Request a' (\a  -> go (fa  a ))
             Respond b  fb' -> Respond b  (\b' -> go (fb' b'))
             M          m   -> M (nat (m >>= \p' -> return (go p')))
             Pure       r   -> Pure r
 
-instance (MonadIO m) => MonadIO (Proxy a' a b' b m) where
+instance (MonadIO m) => MonadIO (ProxySteppable a' a b' b m) where
     liftIO m = M (liftIO (m >>= \r -> return (Pure r)))
 
-instance (MonadReader r m) => MonadReader r (Proxy a' a b' b m) where
+instance (MonadReader r m) => MonadReader r (ProxySteppable a' a b' b m) where
     ask = lift ask
     local f = go
         where
@@ -153,7 +158,7 @@ instance (MonadReader r m) => MonadReader r (Proxy a' a b' b m) where
 #else
 #endif
 
-instance (MonadState s m) => MonadState s (Proxy a' a b' b m) where
+instance (MonadState s m) => MonadState s (ProxySteppable a' a b' b m) where
     get = lift get
     put = lift . put
 #if MIN_VERSION_mtl(2,1,0)
@@ -161,7 +166,7 @@ instance (MonadState s m) => MonadState s (Proxy a' a b' b m) where
 #else
 #endif
 
-instance (MonadWriter w m) => MonadWriter w (Proxy a' a b' b m) where
+instance (MonadWriter w m) => MonadWriter w (ProxySteppable a' a b' b m) where
 #if MIN_VERSION_mtl(2,1,0)
     writer = lift . writer
 #else
@@ -184,7 +189,7 @@ instance (MonadWriter w m) => MonadWriter w (Proxy a' a b' b m) where
               M       m      -> M (go `liftM` m)
               Pure    (r, f) -> M (pass (return (Pure r, f)))
 
-instance (MonadError e m) => MonadError e (Proxy a' a b' b m) where
+instance (MonadError e m) => MonadError e (ProxySteppable a' a b' b m) where
     throwError = lift . throwError
     catchError p0 f = go p0
       where
@@ -196,11 +201,11 @@ instance (MonadError e m) => MonadError e (Proxy a' a b' b m) where
                 p' <- m
                 return (go p') ) `catchError` (\e -> return (f e)) )
 
-instance (MonadPlus m) => Alternative (Proxy a' a b' b m) where
+instance (MonadPlus m) => Alternative (ProxySteppable a' a b' b m) where
     empty = mzero
     (<|>) = mplus
 
-instance (MonadPlus m) => MonadPlus (Proxy a' a b' b m) where
+instance (MonadPlus m) => MonadPlus (ProxySteppable a' a b' b m) where
     mzero = lift mzero
     mplus p0 p1 = go p0
       where
@@ -227,11 +232,86 @@ instance (MonadPlus m) => MonadPlus (Proxy a' a b' b m) where
     This function is a convenience for low-level @pipes@ implementers.  You do
     not need to use 'observe' if you stick to the safe API.
 -}
-observe :: (Monad m) => Proxy a' a b' b m r -> Proxy a' a b' b m r
-observe p0 = M (go p0) where
+observeSteppable :: (Monad m) => ProxySteppable a' a b' b m r -> ProxySteppable a' a b' b m r
+observeSteppable p0 = M (go p0) where
     go p = case p of
-        Request a' fa  -> return (Request a' (\a  -> observe (fa  a )))
-        Respond b  fb' -> return (Respond b  (\b' -> observe (fb' b')))
+        Request a' fa  -> return (Request a' (\a  -> observeSteppable (fa  a )))
+        Respond b  fb' -> return (Respond b  (\b' -> observeSteppable (fb' b')))
         M          m'  -> m' >>= go
         Pure    r      -> return (Pure r)
-{-# INLINABLE observe #-}
+{-# INLINABLE observeSteppable #-}
+
+--------------------------------------------------------------------------------
+
+{-| The Church-encoded 'Proxy'. -}
+
+newtype Proxy a' a b' b m r =  Proxy
+    { unProxy
+        :: forall x
+        .  (a' -> (a  -> x) -> x)
+        -> (b  -> (b' -> x) -> x)
+        -> (           m x  -> x)
+        -> (             r  -> x)
+        -> x
+    }
+
+instance (Monad m) => Functor (Proxy a' a b' b m) where
+    {-# INLINABLE fmap #-}
+    fmap f p =
+        Proxy (\request' respond' lift' pure' ->
+            unProxy p request' respond' lift' (pure' . f))
+
+instance (Monad m) => Monad (Proxy a' a b' b m) where
+    {-# INLINABLE return #-}
+    return r = Proxy (\_ _ _ pure' -> pure' r)
+    {-# INLINABLE (>>=) #-}
+    m >>= f  =
+        Proxy (\request' respond' lift' pure' ->
+            unProxy m request' respond' lift' (\r ->
+                unProxy (f r) request' respond' lift' pure'))
+
+instance MonadTrans (Proxy a' a b' b) where
+    {-# INLINABLE lift #-}
+    lift m = Proxy (\_ _ lift' pure' ->
+        lift' (m >>= \r -> return (pure' r)))
+
+unsafeHoist
+    :: (Monad m)
+    => (forall x . m x -> n x) -> Proxy a' a b' b m r -> Proxy a' a b' b n r
+unsafeHoist nat p = Proxy (\request' respond' lift' pure' ->
+        unProxy p request' respond' (lift' . nat) pure')
+{-# INLINABLE unsafeHoist #-}
+
+-- This is the 'unsafeHoist' and we need some kind of observe here too, right?
+instance MFunctor (Proxy a' a b' b) where
+    {-# INLINABLE hoist #-}
+    hoist nat p = Proxy (\request' respond' lift' pure' ->
+        unProxy p request' respond' (lift' . nat) pure')
+
+instance (MonadIO m) => MonadIO (Proxy a' a b' b m) where
+    {-# INLINE liftIO #-}
+    liftIO m = lift (liftIO m)
+
+
+toProxySteppable :: Proxy a' a b' b m r -> ProxySteppable a' a b' b m r
+toProxySteppable p = unProxy p Request Respond M Pure
+{-# INLINE CONLIKE [1] toProxySteppable #-}
+
+fromProxySteppable :: (Monad m) => ProxySteppable a' a b' b m r -> Proxy a' a b' b m r
+fromProxySteppable p0 = Proxy proxy
+  where
+    proxy request' respond' lift' pure' = go p0
+      where
+        go p = case p of
+            Request a' fa  -> request' a' (go . fa )
+            Respond b  fb' -> respond' b  (go . fb')
+            M fp           -> lift' (liftM go fp)
+            Pure r         -> pure' r
+{-# INLINABLE [1] fromProxySteppable #-}
+
+{-# RULES
+    "toProxySteppable (fromProxySteppable p)" forall p .
+        toProxySteppable (fromProxySteppable p) = p;
+    "fromProxySteppable (toProxySteppable p)" forall p .
+        fromProxySteppable (toProxySteppable p) = p;
+  #-}

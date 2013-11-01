@@ -50,7 +50,7 @@ import qualified Control.Monad.Trans.State.Strict as S
 import qualified Control.Monad.Trans.Writer.Strict as W
 import qualified Control.Monad.Trans.RWS.Strict as RWS
 import Data.Monoid (Monoid)
-import Pipes.Internal (Proxy(..), unsafeHoist)
+import Pipes.Internal (Proxy(..), unsafeHoist, ProxySteppable(..), fromProxySteppable, toProxySteppable)
 import Pipes.Core (runEffect, request, respond, (//>), (>\\))
 
 -- | Wrap the base monad in 'E.ErrorT'
@@ -83,18 +83,32 @@ catchError e h = errorP . E.runErrorT $
     E.catchError (distribute e) (distribute . h)
 {-# INLINABLE catchError #-}
 
+-- TODO(klao): Clean this up!
+
 -- | Catch an error using a catch function for the base monad
 liftCatchError
     :: (Monad m)
-    => (   m (Proxy a' a b' b m r)
-        -> (e -> m (Proxy a' a b' b m r))
-        -> m (Proxy a' a b' b m r) )
+    => (   m (ProxySteppable a' a b' b m r)
+        -> (e -> m (ProxySteppable a' a b' b m r))
+        -> m (ProxySteppable a' a b' b m r) )
     -- ^
     ->    (Proxy a' a b' b m r
         -> (e -> Proxy a' a b' b m r)
         -> Proxy a' a b' b m r)
     -- ^
-liftCatchError c p0 f = go p0
+liftCatchError c p f = fromProxySteppable $ liftCatchErrorO c (toProxySteppable p) (toProxySteppable . f)
+
+liftCatchErrorO
+    :: (Monad m)
+    => (   m (ProxySteppable a' a b' b m r)
+        -> (e -> m (ProxySteppable a' a b' b m r))
+        -> m (ProxySteppable a' a b' b m r) )
+    -- ^
+    ->    (ProxySteppable a' a b' b m r
+        -> (e -> ProxySteppable a' a b' b m r)
+        -> ProxySteppable a' a b' b m r)
+    -- ^
+liftCatchErrorO c p0 f = go p0
   where
     go p = case p of
         Request a' fa  -> Request a' (\a  -> go (fa  a ))

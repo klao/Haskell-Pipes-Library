@@ -75,8 +75,9 @@ import qualified Data.Foldable as F
 import Data.Monoid (Monoid(..))
 import Data.Void (Void)
 import qualified Data.Void as V
-import Pipes.Internal (Proxy(..))
+import Pipes.Internal (ProxySteppable(..))
 import Pipes.Core
+import Pipes.Core.Steppable
 
 -- Re-exports
 import Control.Monad.Morph (MFunctor(hoist))
@@ -372,12 +373,12 @@ instance Enumerable (ErrorT e) where
             Left  _ -> return ()
             Right a -> yield a
 
-{-| Consume the first value from a 'Producer'
+{-| Consume the first value from a steppable 'Producer'
 
     'next' either fails with a 'Left' if the 'Producer' terminates or succeeds
     with a 'Right' providing the next value and the remainder of the 'Producer'.
 -}
-next :: (Monad m) => Producer a m r -> m (Either r (a, Producer a m r))
+next :: (Monad m) => ProducerSteppable a m r -> m (Either r (a, ProducerSteppable a m r))
 next = go
   where
     go p = case p of

@@ -86,7 +86,7 @@ module Pipes.Prelude (
     ) where
 
 import Control.Exception (throwIO, try)
-import Control.Monad (liftM, replicateM_, when, unless)
+import Control.Monad (liftM, replicateM_, when, unless, join)
 import Control.Monad.Trans.State.Strict (get, put)
 import Data.Functor.Identity (Identity, runIdentity)
 import Data.Void (absurd)
@@ -94,6 +94,7 @@ import Foreign.C.Error (Errno(Errno), ePIPE)
 import qualified GHC.IO.Exception as G
 import Pipes
 import Pipes.Core
+import Pipes.Core.Steppable
 import Pipes.Internal
 import Pipes.Lift (evalStateP)
 import qualified System.IO as IO
@@ -390,30 +391,28 @@ True
 
 -- | Strict fold of the elements of a 'Producer'
 fold :: (Monad m) => (x -> a -> x) -> x -> (x -> b) -> Producer a m () -> m b
-fold step begin done p0 = loop p0 begin
+fold step begin done p = unProxy p request' respond' lift' pure' begin
   where
-    loop p x = case p of
-        Request v  _  -> absurd v
-        Respond a  fu -> loop (fu ()) $! step x a
-        M          m  -> m >>= \p' -> loop p' x
-        Pure    _     -> return (done x)
+    request' v _  _ = absurd v
+    respond' a fu x = fu () $! step x a
+    lift'      m  x = m >>= \f -> f x
+    pure'    _    x = return (done x)
 {-# INLINABLE fold #-}
 
 -- | Strict, monadic fold of the elements of a 'Producer'
 foldM
     :: (Monad m)
     => (x -> a -> m x) -> m x -> (x -> m b) -> Producer a m () -> m b
-foldM step begin done p0 = do
+foldM step begin done p = do
     x0 <- begin
-    loop p0 x0
-  where
-    loop p x = case p of
-        Request v  _  -> absurd v
-        Respond a  fu -> do
+    unProxy p request' respond' lift' pure' x0
+      where
+        request' v _  _ = absurd v
+        respond' a fu x = do
             x' <- step x a
-            loop (fu ()) $! x'
-        M          m  -> m >>= \p' -> loop p' x
-        Pure    _     -> done x
+            fu () $! x'
+        lift'      m  x = m >>= \f -> f x
+        pure'    _    x = done x
 {-# INLINABLE foldM #-}
 
 {-| @(all predicate p)@ determines whether all the elements of @p@ satisfy the
@@ -468,11 +467,12 @@ findIndex predicate p = head (p >-> findIndices predicate)
 
 -- | Retrieve the first element from a 'Producer'
 head :: (Monad m) => Producer a m () -> m (Maybe a)
-head p = do
-    x <- next p
-    case x of
-        Left   _     -> return Nothing
-        Right (a, _) -> return (Just a)
+head p = unProxy p request' respond' lift' pure'
+  where
+    request' v _ = absurd v
+    respond' a _ = return (Just a)
+    lift'      m = join m
+    pure'    _   = return Nothing
 {-# INLINABLE head #-}
 
 -- | Index into a 'Producer'
@@ -482,17 +482,12 @@ index n p = head (p >-> drop n)
 
 -- | Retrieve the last element from a 'Producer'
 last :: (Monad m) => Producer a m () -> m (Maybe a)
-last p0 = do
-    x <- next p0
-    case x of
-        Left   _      -> return Nothing
-        Right (a, p') -> loop a p'
+last p = unProxy p request' respond' lift' pure' Nothing
   where
-    loop a p = do
-        x <- next p
-        case x of
-            Left   _       -> return (Just a)
-            Right (a', p') -> loop a' p'
+    request' v _  _ = absurd v
+    respond' a fu _ = fu () (Just a)
+    lift'      m  r = m >>= \f -> f r
+    pure'    _    r = return r
 {-# INLINABLE last #-}
 
 -- | Count the number of elements in a 'Producer'
@@ -521,10 +516,10 @@ minimum = fold step Nothing id
 -- | Determine if a 'Producer' is empty
 null :: (Monad m) => Producer a m () -> m Bool
 null p = do
-    x <- next p
+    x <- head p
     return $ case x of
-        Left  _ -> True
-        Right _ -> False
+        Nothing -> True
+        Just _  -> False
 {-# INLINABLE null #-}
 
 -- | Compute the sum of the elements of a 'Producer'
@@ -539,13 +534,12 @@ product = fold (*) 1 id
 
 -- | Convert a pure 'Producer' into a list
 toList :: Producer a Identity () -> [a]
-toList = loop
+toList p = unProxy p request' respond' lift' pure'
   where
-    loop p = case p of
-        Request v _  -> absurd v
-        Respond a fu -> a:loop (fu ())
-        M         m  -> loop (runIdentity m)
-        Pure    _    -> []
+    request' v _  = absurd v
+    respond' a fu = a : fu ()
+    lift'      m  = runIdentity m
+    pure'    _    = []
 {-# INLINABLE toList #-}
 
 {-| Convert an effectful 'Producer' into a list
@@ -556,15 +550,14 @@ toList = loop
     memory.
 -}
 toListM :: (Monad m) => Producer a m () -> m [a]
-toListM = loop
+toListM p = unProxy p request' respond' lift' pure'
   where
-    loop p = case p of
-        Request v _  -> absurd v
-        Respond a fu -> do
-            as <- loop (fu ())
-            return (a:as)
-        M         m  -> m >>= loop
-        Pure    _    -> return []
+    request' v _  = absurd v
+    respond' a fu = do
+        as <- fu ()
+        return (a:as)
+    lift'      m  = join m
+    pure'    _    = return []
 {-# INLINABLE toListM #-}
 
 -- | Zip two 'Producer's
@@ -581,7 +574,16 @@ zipWith :: (Monad m)
     -> (Producer  a m r)
     -> (Producer  b m r)
     -> (Producer' c m r)
-zipWith f = go
+zipWith f pa pb = fromProxySteppable $ zipWithSteppable f (toProxySteppable pa) (toProxySteppable pb)
+
+
+-- | Zip two steppable 'Producer's using the provided combining function
+zipWithSteppable :: (Monad m)
+    => (a -> b -> c)
+    -> (ProducerSteppable  a m r)
+    -> (ProducerSteppable  b m r)
+    -> (ProducerSteppable' c m r)
+zipWithSteppable f = go
   where
     go p1 p2 = do
         e1 <- lift $ next p1
@@ -592,7 +594,7 @@ zipWith f = go
                 case e2 of
                     Left r         -> return r
                     Right (b, p2') -> do
-                        yield (f a b)
+                        respondSteppable (f a b)
                         go p1' p2'
 {-# INLINABLE zipWith #-}
 
